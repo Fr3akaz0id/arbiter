@@ -6,7 +6,10 @@ against this by changing the base URL and the key. Everything this adds is an ex
 Jev client ignores.
 """
 import asyncio
+import importlib.util
+import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Union
@@ -17,6 +20,24 @@ from pydantic import BaseModel
 
 from . import metrics
 from .errors import OptionBudgetError, OverloadedError
+
+log = logging.getLogger("arbiter.server")
+
+# The guard policy (state, questions, verdict math) lives in integrations/ next to the MCP
+# bridge; load it by path so the hook, the MCP tool, and this shim cannot drift apart.
+_GUARD_POLICY = os.environ.get("ARBITER_GUARD_POLICY") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "integrations",
+    "claude-code", "hooks", "guard_policy.py")
+
+def _guard_policy():
+    if not os.path.exists(_GUARD_POLICY):
+        raise FileNotFoundError("guard policy missing at %s; set ARBITER_GUARD_POLICY" % _GUARD_POLICY)
+    spec = importlib.util.spec_from_file_location("guard_policy", _GUARD_POLICY)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError("guard policy spec failed at %s" % _GUARD_POLICY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 VERSION = (os.environ.get("ARBITER_VERSION") or "").strip() or "0.0.0-dev"
 
@@ -317,6 +338,87 @@ def create_app(engine=None) -> FastAPI:
     @app.post("/v1/predict")
     async def predict(req: Request, authorization: Optional[str] = Header(default=None)):
         return await _systemone(req, authorization)
+
+    # -- OpenAI chat-completions shim: Hermes smart-approval gate ----------------
+    # Hermes' dangerous-command guardian speaks chat completions (agent/auxiliary_client
+    # call_llm, task=approval) and expects the reply to be exactly one word: APPROVE,
+    # DENY or ESCALATE. This route translates that into the guard policy the arbiter_gate
+    # MCP tool already uses, so both entry points share one policy and one engine. On any
+    # internal failure it answers ESCALATE with 200: Hermes treats a non-APPROVE/DENY reply
+    # as "show the user the approval prompt", which is the fail-open behavior we want (a
+    # dead sidecar must never block the shell).
+    _CMD_BLOCK = re.compile(r"<command>\n(.*?)\n</command>", re.DOTALL)
+    _FLAGGED_AS = re.compile(r"flagged as:\s*(.+)")
+
+    def _chat_completion(model_name: str, content: str, reasoning: str) -> Dict[str, Any]:
+        return {
+            "id": "gate-%s" % int(time.time() * 1000),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1},
+            "arbiter_gate": reasoning,
+        }
+
+    async def gate_completions(req: Request, authorization: Optional[str] = Header(default=None)):
+        started = time.perf_counter()
+        denied = check_auth(authorization)
+        if denied is not None:
+            return denied
+        eng = app.state.engine
+        if eng is None:
+            return JSONResponse(status_code=503, content=_chat_completion(
+                "arbiter-gate", "ESCALATE", "models still loading; escalating to user"))
+        try:
+            payload = await req.json()
+        except Exception:
+            return JSONResponse(status_code=422, content=_chat_completion(
+                "arbiter-gate", "ESCALATE", "body is not valid JSON"))
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list):
+            return JSONResponse(status_code=422, content=_chat_completion(
+                "arbiter-gate", "ESCALATE", "no messages array"))
+        prompt = " ".join(str(m.get("content") or "") for m in messages
+                          if isinstance(m, dict))
+        cmd_match = _CMD_BLOCK.search(prompt)
+        if not cmd_match:
+            return JSONResponse(status_code=422, content=_chat_completion(
+                "arbiter-gate", "ESCALATE", "no <command> block found in prompt"))
+        command = cmd_match.group(1)
+        desc_match = _FLAGGED_AS.search(prompt)
+        description = desc_match.group(1).strip() if desc_match else None
+        try:
+            policy = _guard_policy()
+            if policy.is_read_only(command):
+                decision, risk, reason = policy.decide(None, command)
+                word = {"allow": "APPROVE", "ask": "ESCALATE", "deny": "DENY"}[decision]
+                return _chat_completion("arbiter-gate", word, "%s (read-only fast path, 0 ms)" % reason)
+            state = policy.build_state(command, description, None)
+            questions = {qid: dict(q) for qid, q in policy.QUESTIONS.items()}
+            routing = eng.route(state, questions, model=None, task=None, lang=None)
+            name = routing["model"]
+            loop = asyncio.get_running_loop()
+            out = await loop.run_in_executor(None, eng.infer, name, state, questions)
+            decision, risk, reason = policy.decide(out["answers"], command)
+            word = {"allow": "APPROVE", "ask": "ESCALATE", "deny": "DENY"}[decision]
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+            app.state.metrics.observe_request(name, 200, len(questions), time.perf_counter() - started)
+            log.info("gate: %s risk=%.2f in %.1f ms :: %s", word, risk, elapsed_ms, command[:80])
+            return _chat_completion(
+                "laya-%s" % name, word, "%s (%.0f ms)" % (reason, elapsed_ms))
+        except Exception as exc:  # fail-open: escalate to the user, never block the shell
+            log.warning("gate shim failed (%s: %s); escalating", type(exc).__name__, exc)
+            return _chat_completion("arbiter-gate", "ESCALATE",
+                                    "shim error %s: %s" % (type(exc).__name__, exc))
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(req: Request, authorization: Optional[str] = Header(default=None)):
+        return await gate_completions(req, authorization)
 
     return app
 

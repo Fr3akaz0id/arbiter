@@ -3,6 +3,12 @@
 Serve typed-decision models — Laya or your own — on your GPU or your Mac, with a Jev-compatible
 API.
 
+**This fork adds one endpoint:** `POST /v1/chat/completions`, a guard for tools that already
+speak OpenAI's chat protocol — point your agent's approval model at it and every command gets a
+single-word verdict in a few milliseconds. The upstream project is
+[0xBakeer/arbiter](https://github.com/0xBakeer/arbiter); this branch is a pull request against it.
+See [Use it from an OpenAI client](#use-it-from-an-openai-client).
+
 Read the story behind it: [My cat woke me at five on a Sunday, so I built a local Jev](https://blog.0xbakeer.com/my-cat-woke-me-at-five-on-a-sunday-so-i-built-a-local-jev-1350583cddc6?sharedUserId=0xbakeer)
 
 ![How it works](docs/media/how-it-works.gif)
@@ -227,6 +233,63 @@ of milliseconds, failing open when the server is not there. Ready-made configura
 OpenCode, omp and any generic `.mcp.json` client, plus a GitHub Actions job that gates pull
 requests, is in [`integrations/`](integrations) and documented in
 [`docs/integrations.md`](docs/integrations.md).
+
+## Use it from an OpenAI client
+
+Not every agent speaks Jev or MCP. Many have an "approval model" or "smart-approval" hook that
+just calls an OpenAI-compatible `POST /v1/chat/completions` and expects the reply to be **one
+word**. This fork adds exactly that endpoint, so any of them can gate on the arbiter with no
+adapter code:
+
+```bash
+curl -s localhost:8010/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "laya-english",
+  "messages": [{
+    "role": "user",
+    "content": "The following command was flagged as: deletes files outside the repo\n\n<command>\nrm -rf /var/log/app\n</command>\n\nAssess the ACTUAL risk of the shell operations in this command.\n\nRespond with exactly one word: APPROVE, DENY, or ESCALATE"
+  }]
+}'
+```
+
+```json
+{
+  "id": "gate-1789923664857",
+  "object": "chat.completion",
+  "created": 1789923664,
+  "model": "laya-english",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "DENY"}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1},
+  "arbiter_gate": "Arbiter: risk 0.87 of 1, led by destroys_data 0.92 (confirm at 0.50, refuse at 0.78). (102 ms)"
+}
+```
+
+`choices[0].message.content` is the whole decision:
+
+| reply | the arbiter said | the client should |
+|---|---|---|
+| `APPROVE` | `allow` | run it, no human |
+| `ESCALATE` | `ask` (or the arbiter is down) | show the user the approval prompt |
+| `DENY` | `deny` | stop, do not run |
+
+The extra `arbiter_gate` key carries the reason and the latency; a strict OpenAI client ignores
+it, and a gate-aware client can surface it. The endpoint reuses the same guard policy as the
+`arbiter_gate` MCP tool, so both entry points agree by construction.
+
+A few details that matter when wiring it up:
+
+- **The command is read from a `<command>` block** in the prompt, not from the whole message.
+  The flagged command must sit inside `<command> … </command>`; an optional `flagged as: …` line
+  is picked up too and fed to the decision. A read-only command short-circuits to a decision in
+  roughly 0 ms without a forward pass; anything else is one `POST` to the router. A request with
+  no `<command>` block (or no `messages` array, or a body that is not JSON) comes back `422`.
+- **It fails open.** Every failure path returns the same one-word `ESCALATE` body, so a client
+  that reads `choices[0].message.content` and treats anything but `APPROVE`/`DENY` as "ask the
+  user" stays correct no matter what the HTTP status is: `503` while the models are still
+  loading, `422` for a malformed request, and `200` for a thrown inference. A dead sidecar must
+  never wedge the shell, and this is how it is guaranteed.
+- **It is the same server.** No extra process, no extra model, no new dependency — the endpoint
+  rides on the arbiter already serving `/v1/systemone` on the same port, and honours
+  `ARBITER_API_KEY` exactly like the rest of the API.
 
 ## The numbers
 
