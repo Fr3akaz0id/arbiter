@@ -23,13 +23,25 @@ Install: pip install "mcp>=2"   (or `pip install .` in this directory for the `a
 
 Configuration comes from the environment: ARBITER_URL (default http://localhost:8010),
 ARBITER_API_KEY (optional), ARBITER_MODEL (default "auto" -- let the server route).
+
+The transport is chosen by the command line, then the environment, then the default stdio:
+
+    --transport stdio | sse | streamable-http   (env: ARBITER_MCP_TRANSPORT)
+    --host HOST --port PORT --path PATH         (env: ARBITER_MCP_HOST / _PORT / _PATH)
+    --message-path PATH                          (env: ARBITER_MCP_MESSAGE_PATH; sse only)
+
+stdio stays the default so an agent that spawns this file as a subprocess sees no change.
+The HTTP transports expose the same five tools to any MCP client on the wire, which is what
+lets the bridge run next to the server it fronts instead of on every agent host. Defaults
+bind 127.0.0.1:8020 on /mcp; serving the LAN is a deliberate act, so set --host 0.0.0.0.
 """
+import argparse
 import importlib.util
 import json
 import os
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from mcp.server.mcpserver import MCPServer
@@ -43,6 +55,19 @@ ARBITER_URL = os.environ.get("ARBITER_URL", "http://localhost:8010").rstrip("/")
 ARBITER_API_KEY = os.environ.get("ARBITER_API_KEY")
 ARBITER_MODEL = os.environ.get("ARBITER_MODEL", "auto")
 TIMEOUT = float(os.environ.get("ARBITER_TIMEOUT", "30"))
+
+# Transport selection. The command line wins, the environment is the second layer, and stdio is
+# the default, so an agent that spawns this file as a subprocess is unaffected by the new
+# transports. The names of the per-transport keyword arguments are the SDK's own
+# (run_streamable_http_async takes host/port/streamable_http_path, run_sse_async takes
+# host/port/sse_path/message_path) and the test suite pins them, because a rename upstream would
+# otherwise fail at the first request rather than at import.
+TRANSPORTS = ("stdio", "sse", "streamable-http")
+DEFAULT_TRANSPORT = os.environ.get("ARBITER_MCP_TRANSPORT", "stdio")
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8020
+DEFAULT_PATH = "/mcp"
+DEFAULT_MESSAGE_PATH = "/messages/"
 
 # Option descriptions share a fixed token budget with the state, and accuracy falls off well
 # before the server's hard limit, so the tool refuses long option lists rather than answering
@@ -295,8 +320,58 @@ def arbiter_decide(state: Any, questions: Dict[str, Any],
     return result(", ".join(summary), payload)
 
 
+def transport_plan(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
+    """Decide how to serve, without serving. Pure: returns (transport, kwargs) the caller runs with.
+
+    Kept apart from main() because run() never returns -- each SDK transport ends in
+    anyio.run(...) and blocks until the process is stopped. A selector that also ran would be
+    untestable; this one is a function of its arguments, so the suite can pin the flag and
+    environment precedence and the exact SDK keyword names without starting a socket.
+    """
+    if args.transport == "stdio":
+        return "stdio", {}                       # stdio takes no host or port; the agent owns the pipes
+    kwargs: Dict[str, Any] = {"host": args.host, "port": args.port}
+    if args.transport == "streamable-http":
+        kwargs["streamable_http_path"] = args.path
+    else:                                        # sse: the legacy pair of endpoints
+        kwargs["sse_path"] = args.path
+        kwargs["message_path"] = args.message_path
+    return args.transport, kwargs
+
+
+def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
+    """Flags over environment over defaults, as in core(1). Every knob has an ARBITER_MCP_* twin.
+
+    The environment is read here, at call time, and not captured at import: the module is
+    imported once by the test suite and by anyone embedding it, and a daemon that froze its
+    configuration at import would ignore the unit file it is later handed.
+    """
+    parser = argparse.ArgumentParser(prog="arbiter-mcp",
+                                     description="Serve the five arbiter decisions as MCP tools.")
+    parser.add_argument(
+        "--transport", choices=TRANSPORTS,
+        default=os.environ.get("ARBITER_MCP_TRANSPORT", DEFAULT_TRANSPORT),
+        help="MCP wire transport (env: ARBITER_MCP_TRANSPORT; default stdio)")
+    parser.add_argument(
+        "--host", default=os.environ.get("ARBITER_MCP_HOST", DEFAULT_HOST),
+        help="bind address for the HTTP transports (env: ARBITER_MCP_HOST; default 127.0.0.1; "
+             "use 0.0.0.0 to serve the LAN)")
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("ARBITER_MCP_PORT", DEFAULT_PORT)),
+        help="bind port for the HTTP transports (env: ARBITER_MCP_PORT; default 8020)")
+    parser.add_argument(
+        "--path", default=os.environ.get("ARBITER_MCP_PATH", DEFAULT_PATH),
+        help="the MCP endpoint path (env: ARBITER_MCP_PATH; default /mcp)")
+    parser.add_argument(
+        "--message-path", default=os.environ.get("ARBITER_MCP_MESSAGE_PATH", DEFAULT_MESSAGE_PATH),
+        help="POST endpoint for the sse transport (env: ARBITER_MCP_MESSAGE_PATH; default /messages/)")
+    return parser.parse_args(argv)
+
+
 def main() -> None:
-    server.run(transport="stdio")
+    args = parse_args()
+    transport, kwargs = transport_plan(args)
+    server.run(transport=transport, **kwargs)
 
 
 if __name__ == "__main__":

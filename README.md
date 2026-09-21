@@ -226,6 +226,26 @@ claude mcp add arbiter --env ARBITER_URL=http://localhost:8010 -- python3 $PWD/i
 codex  mcp add arbiter --env ARBITER_URL=http://localhost:8010 -- python3 $PWD/integrations/mcp/arbiter_mcp.py
 ```
 
+stdio is the default, which is what an agent spawning the file as a subprocess wants. On a shared
+machine, run it once beside the server instead of once per agent host, and every client dials it:
+
+```bash
+python3 integrations/mcp/arbiter_mcp.py --transport streamable-http --host 0.0.0.0 --port 8020
+# then point the client at http://HOST:8020/mcp (Hermes example, config.yaml):
+#   mcp_servers:
+#     arbiter:
+#       transport: http
+#       url: http://HOST:8020/mcp
+```
+
+`--transport stdio | sse | streamable-http`, and every flag has an `ARBITER_MCP_*` environment
+twin (`ARBITER_MCP_TRANSPORT`, `_HOST`, `_PORT`, `_PATH`, `_MESSAGE_PATH`) so a systemd unit can
+carry the configuration without a shell in the loop; see
+[`systemd/arbiter-mcp.service`](systemd/arbiter-mcp.service). The default bind is `127.0.0.1`:
+serving the LAN is a deliberate act, so say `--host 0.0.0.0` on purpose. The bridge imports
+nothing but the standard library and the MCP SDK, so it needs a 57 MB venv, not the 5.6 GB one
+the torch server lives in.
+
 [`integrations/claude-code/`](integrations/claude-code) is a plugin that adds a skill (when to
 use which primitive, how to shape state and questions, why thresholds belong in your code) and a
 `PreToolUse` hook that judges every `Bash` command before it runs — allow, ask or deny, in tens
