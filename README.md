@@ -407,6 +407,48 @@ the small question counts — 326 ms for one question instead of 20.9 — and th
 halves, to 88 questions/s at eight callers against 287 idle, with no errors. Both sets of tables
 are in [bench/results.md](bench/results.md).
 
+### Before it shares a card: the admission gate
+
+Headroom at the moment you start is not the same fact as headroom you own. A configuration was
+run on a 16,311 MiB card in which a second server was meant to come up after the first released
+it; every metric recorded during the experiment looked fine, and in use it was not. The failure
+mode is a race, not an arithmetic error: `nvidia-smi` reports free memory, and free memory
+includes whatever the process that is still tearing down has not handed back yet.
+
+[`wait-vram.sh`](wait-vram.sh) is the answer, wired in front of the server as
+`ExecStartPre=`: it polls one named card until that card reports a floor of free memory, then
+admits, and on timeout it **exits non-zero**. The non-zero exit is the whole design. The unit
+carries `Restart=on-failure`, so a refusal becomes a retry twenty seconds later instead of an
+oversubscription with a warning in the log. A gate that only prints is a gate that loses.
+
+Measured on the box it runs on: it admitted at 15,885 MiB free against a 6,144 MiB floor the
+moment the resident 35B lane released the card, and refused a run at 980 MiB free while that lane
+still held 14.9 GiB, printing `FATAL` and the card it would not oversubscribe. Steady state,
+server plus gate: 4,978 MiB used, 10,912 MiB free. [`tests/test_gpu_admission.py`](tests/test_gpu_admission.py)
+pins the arithmetic, the per-card lookup (reading the neighbour's headroom is the bug), and the
+wire itself, because a unit that ships without the `ExecStartPre=` line is the same bug wearing a
+different file. It fakes `nvidia-smi` on `PATH` rather than assuming it is absent, so it passes
+on a driver box and a headless one alike.
+
+[`systemd/arbiter.service`](systemd/arbiter.service) is the system unit those measurements were
+taken with, byte for byte as deployed, and it is a different animal from
+[`deploy/arbiter.service`](deploy/arbiter.service), which remains the unprivileged user-unit
+template for someone installing into a home directory. Three differences matter:
+`Environment=CUDA_VISIBLE_DEVICES=1` so the process cannot drift onto a neighbour's card,
+`Environment=ARBITER_DEVICE=cuda` rather than `auto` so a missing CUDA context aborts instead of
+serving quietly on the CPU at a tenth the speed, and the gate. The two are meant to be read as
+what each one is for: `deploy/` is the template you edit, `systemd/` is the record of a unit
+that ran.
+
+[`build-venv.sh`](build-venv.sh) is the same kind of record for the other half of a rebuild. It
+installs the package set the measurements above belong to, pinned (`laya==0.3.4`, `mcp>=2`, torch
+from the CUDA 13.0 index, which carries both `aarch64` and `x86_64` builds), and it deliberately
+omits the checkpoint download that `./run.sh setup` performs: on a LAN of machines that already
+have the weights, re-pulling 2.3 GB from the hub is a slower and less reproducible way to obtain
+a file you already hold and can hash. It ends by importing `server.app` and printing the device
+capability of every card it can see, so a build that produced a CPU-only torch fails the build
+step rather than the deployment.
+
 Three checkpoints is 1.16B parameters, which
 is small enough that the decision is about whether you want all three rather than about whether
 they fit; `ARBITER_MODELS=english` alone is about 1.9 GB.

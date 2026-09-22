@@ -1,0 +1,37 @@
+[Unit]
+Description=[arbiter] Laya typed-decision sidecar + Hermes approval gate :8010 on CUDA1 (fork 9ddad32)
+Documentation=https://github.com/Fr3akaz0id/arbiter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/arbiter
+# Pin to the 5060 Ti the genesis lane vacated. CUDA_VISIBLE_DEVICES=1 makes
+# physical GPU1 the only logical cuda:0 torch can see, so arbiter can not
+# drift onto GPU0 where the 27B Bonsai/Prism lane lives.
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+Environment=CUDA_VISIBLE_DEVICES=1
+# Explicit device, not "auto": engines/laya/loader.py passes an explicit
+# value straight through so a missing CUDA context fails LOUDLY instead of
+# quietly serving decisions at a tenth the speed on the CPU.
+Environment=ARBITER_DEVICE=cuda
+Environment=PORT=8010
+Environment=HOST=0.0.0.0
+Environment=WORKERS=1
+# Admission gate, mirrors the gx10 convention of pre-start VRAM checks.
+# 6144 MiB floor: arbiter's measured budget is ~5 GiB, with headroom.
+ExecStartPre=/opt/arbiter/wait-vram.sh 1 6144 900
+ExecStart=/opt/arbiter/run.sh serve-foreground
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=600
+TimeoutStopSec=60
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arbiter
+OOMScoreAdjust=-300
+
+[Install]
+WantedBy=multi-user.target
